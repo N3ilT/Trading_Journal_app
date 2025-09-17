@@ -1,0 +1,1821 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+import seaborn as sns
+import sqlite3
+import os
+import glob
+from datetime import datetime, timedelta
+import calendar
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Page configuration
+st.set_page_config(
+    page_title="Trading Journal Analyzer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main > div {
+        padding-top: 2rem;
+    }
+    .stMetric {
+        background-color: #000000;  /* Slightly darker gray for better contrast */
+        color: #333333;  /* Dark gray text for readability */
+        border: 1px solid #d0d2d5;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+    }
+    .success-metric {
+        background-color: #d4edda;
+        border-color: #c3e6cb;
+        color: #333333;  /* Ensure consistent text color */
+    }
+    .danger-metric {
+        background-color: #f8d7da;
+        border-color: #f5c6cb;
+        color: #333333;  /* Ensure consistent text color */
+    }
+</style>
+""", unsafe_allow_html=True)
+
+class TradingJournalAnalyzerST:
+    def __init__(self):
+        self.db_path = "trading_journal_analyzer.db"
+        self.init_session_state()
+        self.init_database()
+        self.load_chart_settings()
+
+    def init_session_state(self):
+        """Initialize Streamlit session state variables"""
+        if 'trade_data' not in st.session_state:
+            st.session_state.trade_data = pd.DataFrame()
+        if 'market_data' not in st.session_state:
+            st.session_state.market_data = pd.DataFrame()
+        if 'enhanced_trades' not in st.session_state:
+            st.session_state.enhanced_trades = pd.DataFrame()
+        if 'analysis_complete' not in st.session_state:
+            st.session_state.analysis_complete = False
+        if 'current_view_date' not in st.session_state:
+            st.session_state.current_view_date = datetime.now().replace(day=1)
+        # Initialize chart colors
+        default_colors = {
+            'plot_bgcolor': '#000000',  # Black
+            'paper_bgcolor': '#000000',  # Black
+            'text_grid_color': '#FFFFFF',  # White
+            'up_candle_color': '#00FF00',  # Green
+            'down_candle_color': '#FF0000',  # Red
+            'buy_triangle_color': '#0000FF',  # Blue
+            'sell_triangle_color': '#FF0000',  # Red
+            'trade_line_color': '#00FF00',  # Green (for winning trades)
+            'trade_line_loss_color': '#FF0000'  # Red (for losing trades)
+        }
+        if 'chart_colors' not in st.session_state:
+            st.session_state.chart_colors = default_colors
+        else:
+            # Ensure all default colors are present, even if session state exists
+            for key, value in default_colors.items():
+                if key not in st.session_state.chart_colors:
+                    st.session_state.chart_colors[key] = value
+
+    def init_database(self):
+        """Initialize SQLite database with trades, market_data, enhanced_trades, and chart_settings tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Drop existing tables to ensure schema consistency
+        cursor.execute("DROP TABLE IF EXISTS trades")
+        cursor.execute("DROP TABLE IF EXISTS market_data")
+        cursor.execute("DROP TABLE IF EXISTS enhanced_trades")
+        cursor.execute("DROP TABLE IF EXISTS chart_settings")
+
+        # Create trades table
+        cursor.execute('''
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                priceFormat INTEGER,
+                priceFormatType INTEGER,
+                tickSize REAL,
+                buyFillId INTEGER,
+                sellFillId INTEGER,
+                qty INTEGER,
+                buyPrice REAL,
+                sellPrice REAL,
+                pnl REAL,
+                boughtTimestamp TEXT,
+                soldTimestamp TEXT,
+                duration TEXT,
+                duration_minutes REAL,
+                side TEXT,
+                entry_time TEXT,
+                exit_time TEXT,
+                entry_price REAL,
+                exit_price REAL
+            )
+        ''')
+
+        # Create market_data table
+        cursor.execute('''
+            CREATE TABLE market_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                symbol TEXT
+            )
+        ''')
+
+        # Create enhanced_trades table with notes column
+        cursor.execute('''
+            CREATE TABLE enhanced_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol_letters TEXT,
+                symbol TEXT,
+                qty INTEGER,
+                buyPrice REAL,
+                sellPrice REAL,
+                pnl REAL,
+                pnl_pct REAL,
+                boughtTimestamp TEXT,
+                soldTimestamp TEXT,
+                duration_minutes REAL,
+                side TEXT,
+                entry_time TEXT,
+                exit_time TEXT,
+                bars_in_trade INTEGER,
+                entry_to_high_bars INTEGER,
+                entry_to_low_bars INTEGER,
+                mae REAL,
+                mfe REAL,
+                strategy TEXT,
+                tag TEXT,
+                efficiency REAL,
+                rr_ratio REAL,
+                entry_hour INTEGER,
+                entry_dow TEXT,
+                notes TEXT
+            )
+        ''')
+
+        # Create chart_settings table
+        cursor.execute('''
+            CREATE TABLE chart_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                setting_name TEXT UNIQUE,
+                setting_value TEXT
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+
+    def load_chart_settings(self):
+        """Load chart color settings from database into session state"""
+        default_colors = {
+            'plot_bgcolor': '#000000',
+            'paper_bgcolor': '#000000',
+            'text_grid_color': '#FFFFFF',
+            'up_candle_color': '#00FF00',
+            'down_candle_color': '#FF0000',
+            'buy_triangle_color': '#0000FF',
+            'sell_triangle_color': '#FF0000',
+            'trade_line_color': '#00FF00',
+            'trade_line_loss_color': '#FF0000'
+        }
+        # Initialize with defaults if not set
+        if 'chart_colors' not in st.session_state:
+            st.session_state.chart_colors = default_colors.copy()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT setting_name, setting_value FROM chart_settings")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # Update session state with database values, preserving defaults for missing keys
+        for name, value in rows:
+            if name in default_colors:
+                st.session_state.chart_colors[name] = value
+
+    def save_chart_settings(self):
+        """Save chart color settings to database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        for name, value in st.session_state.chart_colors.items():
+            cursor.execute('''
+                INSERT OR REPLACE INTO chart_settings (setting_name, setting_value)
+                VALUES (?, ?)
+            ''', (name, value))
+        conn.commit()
+        conn.close()
+
+    def import_trade_data(self, uploaded_files):
+        """Import trade data from uploaded CSV files"""
+        if not uploaded_files:
+            return False, "No files uploaded"
+        
+        try:
+            dfs = []
+            for file in uploaded_files:
+                df = pd.read_csv(file)
+                
+                # Remove leading underscores from column names
+                column_mapping = {}
+                for col in df.columns:
+                    if col.startswith('_'):
+                        column_mapping[col] = col[1:]
+                if column_mapping:
+                    df = df.rename(columns=column_mapping)
+                
+                dfs.append(df)
+            
+            df = pd.concat(dfs, ignore_index=True)
+            
+            # Validate required columns
+            required_columns = ['symbol', 'qty', 'buyPrice', 'sellPrice', 'pnl', 
+                              'boughtTimestamp', 'soldTimestamp']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                return False, f"Missing required columns: {', '.join(missing_columns)}"
+            
+            # Process P&L data
+            if df['pnl'].dtype == 'object':
+                df['pnl'] = df['pnl'].astype(str).str.strip()
+                # Handle parentheses (negative format)
+                parentheses_pattern = r'\(.*\)'
+                parentheses_mask = df['pnl'].str.contains(parentheses_pattern, na=False)
+                if parentheses_mask.any():
+                    df.loc[parentheses_mask, 'pnl'] = df.loc[parentheses_mask, 'pnl'].str.replace('(', '-').str.replace(')', '')
+                
+                # Clean currency symbols
+                df['pnl'] = df['pnl'].str.replace('$', '', regex=False)
+                df['pnl'] = df['pnl'].str.replace(',', '', regex=False)
+                df['pnl'] = df['pnl'].str.replace('USD', '', regex=False)
+                df['pnl'] = df['pnl'].str.replace('usd', '', regex=False)
+                df['pnl'] = df['pnl'].str.replace(' ', '', regex=False)
+                
+                df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+            
+            # Process timestamps
+            df['boughtTimestamp'] = pd.to_datetime(df['boughtTimestamp'], errors='coerce')
+            df['soldTimestamp'] = pd.to_datetime(df['soldTimestamp'], errors='coerce')
+            
+            # Convert from Central to Eastern Time
+            if df['boughtTimestamp'].dt.tz is None:
+                df['boughtTimestamp'] = df['boughtTimestamp'].dt.tz_localize('US/Central')
+                df['soldTimestamp'] = df['soldTimestamp'].dt.tz_localize('US/Central')
+            df['boughtTimestamp'] = df['boughtTimestamp'].dt.tz_convert('US/Eastern')
+            df['soldTimestamp'] = df['soldTimestamp'].dt.tz_convert('US/Eastern')
+            df['boughtTimestamp'] = df['boughtTimestamp'].dt.tz_localize(None)
+            df['soldTimestamp'] = df['soldTimestamp'].dt.tz_localize(None)
+            
+            # Process duration
+            if 'duration' in df.columns:
+                import re
+                def parse_duration_to_minutes(val):
+                    if pd.isnull(val):
+                        return float('nan')
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    val = str(val).strip().lower()
+                    minutes = 0.0
+                    seconds = 0.0
+                    min_match = re.search(r'(\d+)\s*min', val)
+                    sec_match = re.search(r'(\d+)\s*sec', val)
+                    if min_match:
+                        minutes = float(min_match.group(1))
+                    if sec_match:
+                        seconds = float(sec_match.group(1))
+                    if not min_match and not sec_match:
+                        try:
+                            return float(val)
+                        except Exception:
+                            return float('nan')
+                    return minutes + (seconds / 60.0)
+                df['duration_minutes'] = df['duration'].apply(parse_duration_to_minutes)
+            else:
+                df['duration_minutes'] = np.nan
+            
+            # Determine trade direction and entry/exit
+            bought_dt = pd.to_datetime(df['boughtTimestamp'], errors='coerce')
+            sold_dt = pd.to_datetime(df['soldTimestamp'], errors='coerce')
+            
+            df['side'] = np.where(bought_dt < sold_dt, 'Long', 'Short')
+            
+            df['entry_time'] = np.where(sold_dt < bought_dt, sold_dt, bought_dt)
+            df['exit_time'] = np.where(sold_dt < bought_dt, bought_dt, sold_dt)
+            df['entry_price'] = np.where(sold_dt < bought_dt, df['sellPrice'], df['buyPrice'])
+            df['exit_price'] = np.where(sold_dt < bought_dt, df['buyPrice'], df['sellPrice'])
+            
+            # Add missing columns with defaults
+            for col in ['priceFormat', 'priceFormatType', 'buyFillId', 'sellFillId']:
+                if col not in df.columns:
+                    df[col] = 0
+            if 'tickSize' not in df.columns:
+                df['tickSize'] = 0.0
+            
+            # Save to database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM trades")
+            df.to_sql('trades', conn, if_exists='append', index=False)
+            conn.close()
+            
+            st.session_state.trade_data = df
+            return True, f"Successfully imported {len(df)} trades"
+            
+        except Exception as e:
+            return False, f"Error importing trade data: {str(e)}"
+    
+    def import_market_data(self, uploaded_files):
+        """Import market data from uploaded CSV files"""
+        if not uploaded_files:
+            return False, "No files uploaded"
+        
+        try:
+            import re
+            dfs = []
+            for file in uploaded_files:
+                df = pd.read_csv(file)
+                
+                required_columns = ['time', 'open', 'high', 'low', 'close']
+                missing_columns = [col for col in required_columns if col not in df.columns]
+                if missing_columns:
+                    continue
+                
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                df = df.dropna(subset=['time'])
+                
+                if df['time'].dt.tz is not None:
+                    df['time'] = df['time'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+                
+                # Improved symbol extraction using regex to handle patterns like CME_MINI_MES1!, 1 (27)
+                file_name_upper = file.name.upper()
+                symbol_match = re.search(r'MINI_([A-Z]+)1!', file_name_upper)
+                if symbol_match:
+                    symbol = symbol_match.group(1)
+                else:
+                    # Fallback: split and clean if regex fails
+                    base_name = file.name.split('.')[0].upper().replace('CME_MINI_', '').replace('1!', '').replace(',', '').replace(' ', '').strip()
+                    symbol = re.sub(r'\(\d+\)', '', base_name).strip()  # Remove (27)-like parts
+                
+                df['symbol'] = symbol
+                dfs.append(df)
+            
+            if not dfs:
+                return False, "No valid market data found"
+            
+            df = pd.concat(dfs, ignore_index=True)
+            df = df.sort_values('time')
+            
+            # Save to database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM market_data")
+            
+            # Only save columns that match the database schema
+            columns_to_save = ['time', 'open', 'high', 'low', 'close', 'symbol']
+            df_to_save = df[columns_to_save]
+            
+            df_to_save.to_sql('market_data', conn, if_exists='append', index=False)
+            conn.close()
+            
+            # Keep the full dataframe in session state (including original_filename)
+            st.session_state.market_data = df
+            return True, f"Successfully imported {len(df)} market data bars"
+            
+        except Exception as e:
+            return False, f"Error importing market data: {str(e)}"
+    
+
+    def analyze_trades(self, start_date=None, end_date=None, use_all_data=False):
+        """Analyze trades with optional date filtering, including notes column and MAE/MFE excluding entry/exit candles"""
+        if st.session_state.trade_data.empty:
+            return False, "No trade data available"
+        
+        try:
+            trade_data = st.session_state.trade_data.copy()
+            market_data = st.session_state.market_data.copy()
+            
+            # Apply date filtering if specified
+            if not use_all_data and start_date and end_date:
+                start_datetime = datetime.combine(start_date, datetime.min.time())
+                end_datetime = datetime.combine(end_date, datetime.max.time())
+                
+                mask = ((trade_data['boughtTimestamp'] >= start_datetime) & 
+                        (trade_data['soldTimestamp'] <= end_datetime))
+                trade_data = trade_data[mask].copy()
+                
+                if not market_data.empty:
+                    mask = ((market_data['time'] >= start_datetime) & 
+                            (market_data['time'] <= end_datetime))
+                    market_data = market_data[mask].copy()
+            
+            enhanced_trades = []
+            
+            for _, trade in trade_data.iterrows():
+                trade_start = trade['boughtTimestamp']
+                trade_end = trade['soldTimestamp']
+                
+                if pd.isna(trade_start) or pd.isna(trade_end):
+                    continue
+                
+                # Initialize default values
+                bars_in_trade = entry_to_high_bars = entry_to_low_bars = 0
+                mae = mfe = float('nan')
+                calculation_notes = "MAE/MFE exclude entry and exit minute candles"
+                
+                # Process market data if available
+                if not market_data.empty and 'time' in market_data.columns:
+                    # Floor timestamps to minute level to identify entry/exit candles
+                    trade_start_min = pd.Timestamp(trade_start).floor('T')
+                    trade_end_min = pd.Timestamp(trade_end).floor('T')
+                    
+                    # Filter market data to include only candles strictly between entry and exit minutes
+                    trade_market_data = market_data[
+                        (market_data['time'] > trade_start_min) & 
+                        (market_data['time'] < trade_end_min)
+                    ].copy()
+                    
+                    if not trade_market_data.empty:
+                        bars_in_trade = len(trade_market_data)
+                        entry_price = trade['entry_price']
+                        side = trade['side']
+                        
+                        if side == 'Long':
+                            mae = (trade_market_data['low'] - entry_price).min()
+                            mfe = (trade_market_data['high'] - entry_price).max()
+                        else:
+                            mae = (trade_market_data['high'] - entry_price).max()
+                            mfe = (trade_market_data['low'] - entry_price).min()
+                    
+                    # If trade_market_data is empty, note why
+                    if trade_market_data.empty and trade_start_min == trade_end_min:
+                        calculation_notes += "; No candles between entry and exit (same minute)"
+                    elif trade_market_data.empty:
+                        calculation_notes += "; No market data between entry and exit candles"
+                
+                pnl_pct = (trade['pnl'] / (trade['buyPrice'] * trade['qty'])) * 100 if trade['buyPrice'] * trade['qty'] != 0 else 0
+                
+                # Extract base symbol_letters by dropping last 2 chars (e.g., MNQU5 → MNQ)
+                symbol_str = str(trade['symbol']).strip().upper()
+                symbol_letters = symbol_str[:-2] if len(symbol_str) >= 2 else symbol_str
+                
+                enhanced_trade = {
+                    'symbol': trade['symbol'],
+                    'symbol_letters': symbol_letters,
+                    'qty': trade['qty'],
+                    'buyPrice': trade['buyPrice'],
+                    'sellPrice': trade['sellPrice'],
+                    'pnl': trade['pnl'],
+                    'pnl_pct': pnl_pct,
+                    'boughtTimestamp': trade['boughtTimestamp'],
+                    'soldTimestamp': trade['soldTimestamp'],
+                    'duration_minutes': trade['duration_minutes'],
+                    'side': trade['side'],
+                    'entry_time': trade['entry_time'],
+                    'exit_time': trade['exit_time'],
+                    'entry_price': trade['entry_price'],
+                    'exit_price': trade['exit_price'],
+                    'bars_in_trade': bars_in_trade,
+                    'entry_to_high_bars': entry_to_high_bars,
+                    'entry_to_low_bars': entry_to_low_bars,
+                    'mae': mae,
+                    'mfe': mfe,
+                    'strategy': 'Unknown',
+                    'tag': '',
+                    'efficiency': 0,
+                    'rr_ratio': 0,
+                    'entry_hour': trade['boughtTimestamp'].hour,
+                    'entry_dow': trade['boughtTimestamp'].strftime('%A'),
+                    'notes': '',
+                    'calculation_notes': calculation_notes
+                }
+                
+                enhanced_trades.append(enhanced_trade)
+            
+            enhanced_trades_df = pd.DataFrame(enhanced_trades)
+            
+            # Save to database
+            conn = sqlite3.connect(self.db_path)
+            enhanced_trades_df.to_sql('enhanced_trades', conn, if_exists='replace', index=False)
+            conn.close()
+            
+            st.session_state.enhanced_trades = enhanced_trades_df
+            st.session_state.analysis_complete = True
+            
+            return True, f"Successfully analyzed {len(enhanced_trades)} trades"
+            
+        except Exception as e:
+            return False, f"Error analyzing trades: {str(e)}"
+
+    
+    def calculate_statistics(self):
+        """Calculate comprehensive trading statistics"""
+        if st.session_state.enhanced_trades.empty:
+            return {}
+        
+        df = st.session_state.enhanced_trades.copy()
+        
+        total_trades = len(df)
+        winning_trades = len(df[df['pnl'] > 0])
+        losing_trades = len(df[df['pnl'] < 0])
+        
+        total_pnl = df['pnl'].sum()
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        avg_pnl = df['pnl'].mean() if total_trades > 0 else 0
+        
+        avg_win = df[df['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
+        largest_win = df[df['pnl'] > 0]['pnl'].max() if winning_trades > 0 else 0
+        avg_loss = df[df['pnl'] < 0]['pnl'].mean() if losing_trades > 0 else 0
+        largest_loss = df[df['pnl'] < 0]['pnl'].min() if losing_trades > 0 else 0
+        
+        gross_profit = df[df['pnl'] > 0]['pnl'].sum() if winning_trades > 0 else 0
+        gross_loss = abs(df[df['pnl'] < 0]['pnl'].sum()) if losing_trades > 0 else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        
+        avg_duration = df['duration_minutes'].mean() if not df['duration_minutes'].empty else 0
+        
+        # Daily P&L analysis
+        df['trade_date'] = df['entry_time'].dt.date
+        daily_pnl = df.groupby('trade_date')['pnl'].sum()
+        best_day = daily_pnl.max() if not daily_pnl.empty else 0
+        worst_day = daily_pnl.min() if not daily_pnl.empty else 0
+        
+        # Drawdown calculation
+        df_sorted = df.sort_values('exit_time')
+        df_sorted['cumulative_pnl'] = df_sorted['pnl'].cumsum()
+        df_sorted['running_max'] = df_sorted['cumulative_pnl'].expanding().max()
+        df_sorted['drawdown'] = df_sorted['cumulative_pnl'] - df_sorted['running_max']
+        max_drawdown = df_sorted['drawdown'].min()
+        
+        # Sharpe ratio
+        if len(daily_pnl) > 1 and daily_pnl.std() > 0:
+            sharpe_ratio = daily_pnl.mean() / daily_pnl.std() * np.sqrt(252)
+        else:
+            sharpe_ratio = 0
+        
+        # MAE/MFE
+        avg_mae = df['mae'].mean() if 'mae' in df.columns and not df['mae'].isna().all() else 0
+        avg_mfe = df['mfe'].mean() if 'mfe' in df.columns and not df['mfe'].isna().all() else 0
+        
+        return {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
+            'profit_factor': profit_factor,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'largest_win': largest_win,
+            'largest_loss': largest_loss,
+            'max_drawdown': max_drawdown,
+            'avg_duration': avg_duration,
+            'best_day': best_day,
+            'worst_day': worst_day,
+            'sharpe_ratio': sharpe_ratio,
+            'avg_mfe': avg_mfe,
+            'avg_mae': avg_mae
+        }
+
+
+def main():
+    """Main function to run the Streamlit app"""
+    st.title("Trading Journal Analyzer")
+    
+    analyzer = TradingJournalAnalyzerST()
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("Data Import")
+        
+        # Trade data upload
+        st.subheader("Upload Trade Data")
+        trade_files = st.file_uploader("Select trade CSV files", type=['csv'], accept_multiple_files=True, key="trade_upload")
+        if trade_files:
+            success, message = analyzer.import_trade_data(trade_files)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+        
+        # Market data upload
+        st.subheader("Upload Market Data")
+        market_files = st.file_uploader("Select market CSV files", type=['csv'], accept_multiple_files=True, key="market_upload")
+        if market_files:
+            success, message = analyzer.import_market_data(market_files)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+        
+        # Analysis controls
+        st.subheader("Analysis Controls")
+        use_all_data = st.checkbox("Use All Data", value=True)
+        
+        if not use_all_data:
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=30))
+            with col2:
+                end_date = st.date_input("End Date", value=datetime.now())
+        else:
+            start_date = end_date = None
+        
+        if st.button("Analyze Trades"):
+            success, message = analyzer.analyze_trades(start_date, end_date, use_all_data)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+    
+    # Main content with tabs
+    tabs = st.tabs([
+        "Dashboard",
+        "Trade Log",
+        "Market Analysis",
+        "Performance Analytics",
+        "Risk Analysis",
+        "Side Analysis",
+        "Market Conditions",
+        "Calendar View"
+    ])
+    
+    with tabs[0]:
+        show_dashboard(analyzer)
+    with tabs[1]:
+        show_trade_log()
+    with tabs[2]:
+        show_market_analysis()
+    with tabs[3]:
+        show_performance_analytics()
+    with tabs[4]:
+        show_risk_analysis()
+    with tabs[5]:
+        show_side_analysis()
+    with tabs[6]:
+        show_market_conditions()
+    with tabs[7]:
+        show_calendar_view()
+
+
+
+def resample_ohlc(df, timeframe):
+    """Resample OHLC data to the specified timeframe."""
+    if timeframe == '1min':
+        return df
+    resample_rule = {
+        '5min': '5T',
+        '15min': '15T',
+        '1H': '60T'
+    }[timeframe]
+    if 'time' not in df.columns:
+        return df
+    resampled = df.set_index('time').resample(resample_rule).agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    }).dropna().reset_index()
+    return resampled
+
+def calculate_atr(df, period=14):
+    """Calculate Average True Range (ATR) for market data."""
+    df = df.copy()
+    df['high_low'] = df['high'] - df['low']
+    df['high_close'] = np.abs(df['high'] - df['close'].shift())
+    df['low_close'] = np.abs(df['low'] - df['close'].shift())
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=period, min_periods=1).mean()
+    return df
+
+def show_dashboard(analyzer):
+    """Display the main dashboard with key metrics and equity curve"""
+    st.header("📊 Trading Performance Dashboard")
+    
+    stats = analyzer.calculate_statistics()
+    
+    if not stats:
+        st.warning("No statistics available. Please ensure analysis is complete.")
+        return
+    
+    # Key Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Trades", f"{stats['total_trades']:,}")
+        st.metric("Win Rate", f"{stats['win_rate']:.1f}%")
+        
+    with col2:
+        st.metric("Total P&L", f"${stats['total_pnl']:,.2f}")
+        st.metric("Avg P&L/Trade", f"${stats['avg_pnl']:.2f}")
+        
+    with col3:
+        pf = stats['profit_factor']
+        pf_display = "∞" if pf == float('inf') else f"{pf:.2f}"
+        st.metric("Profit Factor", pf_display)
+        st.metric("Max Drawdown", f"${stats['max_drawdown']:.2f}")
+        
+    with col4:
+        st.metric("Avg Duration", f"{stats['avg_duration']:.0f} min")
+        st.metric("Sharpe Ratio", f"{stats['sharpe_ratio']:.2f}")
+    
+    # Additional metrics
+    col5, col6, col7, col8 = st.columns(4)
+    
+    with col5:
+        st.metric("Largest Win", f"${stats['largest_win']:.2f}")
+        st.metric("Avg Win", f"${stats['avg_win']:.2f}")
+        
+    with col6:
+        st.metric("Largest Loss", f"${stats['largest_loss']:.2f}")
+        st.metric("Avg Loss", f"${stats['avg_loss']:.2f}")
+        
+    with col7:
+        st.metric("Best Day", f"${stats['best_day']:.2f}")
+        st.metric("Worst Day", f"${stats['worst_day']:.2f}")
+        
+    with col8:
+        mae_display = f"${stats['avg_mae']:.2f}" if not pd.isna(stats['avg_mae']) else "N/A"
+        mfe_display = f"${stats['avg_mfe']:.2f}" if not pd.isna(stats['avg_mfe']) else "N/A"
+        st.metric("Avg MAE", mae_display)
+        st.metric("Avg MFE", mfe_display)
+    
+    st.markdown("---")
+    
+    # Equity Curve
+    st.subheader("💹 Equity Curve")
+    
+    if not st.session_state.enhanced_trades.empty:
+        df = st.session_state.enhanced_trades.sort_values('exit_time').copy()
+        df['cumulative_pnl'] = df['pnl'].cumsum()
+        
+        fig = go.Figure()
+        
+        # Add equity curve
+        fig.add_trace(go.Scatter(
+            x=df['exit_time'],
+            y=df['cumulative_pnl'],
+            mode='lines',
+            name='Equity Curve',
+            line=dict(color='blue', width=3)
+        ))
+        
+        # Add zero line
+        fig.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
+        
+        # Fill areas
+        fig.add_trace(go.Scatter(
+            x=df['exit_time'],
+            y=df['cumulative_pnl'],
+            fill='tonexty',
+            fillcolor='rgba(0,255,0,0.1)',
+            line=dict(color='rgba(255,255,255,0)'),
+            showlegend=False,
+            name='Profit Area'
+        ))
+        
+        fig.update_layout(
+            title="Cumulative P&L Over Time",
+            xaxis_title="Date",
+            yaxis_title="Cumulative P&L ($)",
+            hovermode='x unified',
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+def show_trade_log():
+    """Display detailed trade log with notes column and notes editing section"""
+    st.header("📋 Trade Analysis Log")
+    
+    if st.session_state.enhanced_trades.empty:
+        st.warning("No enhanced trades available. Please run analysis first.")
+        return
+    
+    df = st.session_state.enhanced_trades.copy()
+    
+    # Format display dataframe
+    display_df = df.copy()
+    display_df['Entry Time'] = pd.to_datetime(display_df['entry_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    display_df['Exit Time'] = pd.to_datetime(display_df['exit_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    display_df['P&L'] = display_df['pnl'].apply(lambda x: f"${x:.2f}")
+    display_df['P&L %'] = display_df['pnl_pct'].apply(lambda x: f"{x:.2f}%")
+    display_df['Entry Price'] = display_df['entry_price'].apply(lambda x: f"${x:.2f}")
+    display_df['Exit Price'] = display_df['exit_price'].apply(lambda x: f"${x:.2f}")
+    display_df['Duration'] = display_df['duration_minutes'].apply(lambda x: f"{x:.0f}m")
+    display_df['Notes'] = display_df['notes'].fillna('')  # Ensure notes column is not null
+    
+    columns_to_show = ['symbol', 'Entry Time', 'Exit Time', 'side', 'qty', 'Entry Price', 
+                      'Exit Price', 'P&L', 'P&L %', 'Duration', 'notes']
+    
+    # Display the trade log table
+    st.dataframe(
+        display_df[columns_to_show].rename(columns={
+            'symbol': 'Symbol',
+            'side': 'Side',
+            'qty': 'Qty',
+            'notes': 'Notes'
+        }),
+        use_container_width=True,
+        height=600
+    )
+    
+    # Notes editing section
+    st.subheader("📝 Edit Trade Notes")
+    trade_options = [(idx, f"{row['symbol']} - {row['entry_time']} (P&L: ${row['pnl']:.2f})") 
+                     for idx, row in df.iterrows()]
+    selected_trade = st.selectbox("Select Trade to Add/Edit Notes", 
+                                 options=[(idx, label) for idx, label in trade_options],
+                                 format_func=lambda x: x[1],
+                                 key="trade_select")
+    
+    if selected_trade:
+        trade_idx = selected_trade[0]
+        current_notes = df.loc[trade_idx, 'notes'] if 'notes' in df.columns and pd.notna(df.loc[trade_idx, 'notes']) else ""
+        new_notes = st.text_area("Notes", value=current_notes, key=f"notes_{trade_idx}")
+        
+        if st.button("Save Notes", key=f"save_notes_{trade_idx}"):
+            # Update notes in enhanced_trades
+            st.session_state.enhanced_trades.loc[trade_idx, 'notes'] = new_notes
+            
+            # Update database
+            conn = sqlite3.connect('trading_journal_analyzer.db')
+            cursor = conn.cursor()
+            cursor.execute('UPDATE enhanced_trades SET notes = ? WHERE id = ?', 
+                          (new_notes, trade_idx + 1))  # id is 1-based in SQLite
+            conn.commit()
+            conn.close()
+            
+            st.success(f"Notes saved for trade {trade_idx + 1}")
+            st.rerun()  # Refresh to update table
+    
+    # Export option
+    if st.button("📥 Export Trade Log as CSV"):
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="Download CSV",
+            data=csv,
+            file_name=f"trade_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+def show_market_analysis():
+    """Display market analysis with dropdown for trades and notes"""
+    st.header("📈 Market Analysis")
+    
+    if st.session_state.enhanced_trades.empty and st.session_state.market_data.empty:
+        st.warning("No market or trade data available. Please upload and analyze data.")
+        return
+    
+    # Get unique symbols from trade data (using symbol_letters for tab names)
+    symbols = sorted(st.session_state.enhanced_trades['symbol_letters'].unique()) if not st.session_state.enhanced_trades.empty else []
+    
+    if not symbols:
+        symbols = sorted(st.session_state.market_data['symbol'].unique()) if not st.session_state.market_data.empty else []
+    
+    if not symbols:
+        st.warning("No symbols available for analysis.")
+        return
+    
+    # Create tabs for each symbol
+    tabs = st.tabs(symbols)
+    
+    for symbol, tab in zip(symbols, tabs):
+        with tab:
+            market_df = st.session_state.market_data[st.session_state.market_data['symbol'] == symbol] if not st.session_state.market_data.empty else pd.DataFrame()
+            trades_df = st.session_state.enhanced_trades[st.session_state.enhanced_trades['symbol_letters'] == symbol] if not st.session_state.enhanced_trades.empty else pd.DataFrame()
+            create_symbol_chart(symbol, market_df, trades_df)
+
+
+def create_symbol_chart(symbol, market_df, trades_df):
+    """Create candlestick chart with trade overlay, color controls in horizontal layout below chart, no legend, and panning"""
+    analyzer = TradingJournalAnalyzerST()  # To access save_chart_settings
+
+    # Filter data for this symbol
+    symbol_market_data = market_df if not market_df.empty else pd.DataFrame()
+    symbol_trades = trades_df if not trades_df.empty else pd.DataFrame()
+    
+    # Check what data is available
+    has_market_data = not symbol_market_data.empty
+    has_trade_data = not symbol_trades.empty
+    
+    # Display data availability info
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Market Data Bars", len(symbol_market_data) if has_market_data else 0)
+    with col2:
+        st.metric("Trades", len(symbol_trades) if has_trade_data else 0)
+    with col3:
+        if has_trade_data:
+            original_symbols = symbol_trades['symbol'].unique() if 'symbol' in symbol_trades.columns else []
+            st.write(f"**Original Trade Symbols:**")
+            for orig_sym in original_symbols:
+                st.write(f"• {orig_sym}")
+    with col4:
+        if has_market_data and has_trade_data:
+            st.success("✅ Full Analysis Available")
+        elif has_market_data:
+            st.warning("📊 Market Data Only")
+        elif has_trade_data:
+            st.warning("📋 Trade Data Only")
+        else:
+            st.error("❌ No Data")
+    
+    if not has_market_data and not has_trade_data:
+        st.warning(f"No data available for {symbol}")
+        return
+    
+    # Create layout with left sidebar for dropdown and notes, right for chart
+    left, right = st.columns([1, 3])
+    
+    with left:
+        st.subheader("Trades")
+        
+        if not has_trade_data:
+            st.info("No trades available for this symbol.")
+        else:
+            # Checkbox to show only selected trade
+            show_only_selected = st.checkbox("Show Only Selected Trade", value=False, key=f"show_only_selected_{symbol}")
+            
+            # Sort trades by entry_time ascending (oldest first)
+            symbol_trades = symbol_trades.sort_values('entry_time')
+            
+            # Create dropdown options: timestamp / direction / P&L
+            trade_options = []
+            for idx, trade in symbol_trades.iterrows():
+                timestamp = pd.to_datetime(trade['entry_time']).strftime('%Y-%m-%d %H:%M:%S')
+                direction = trade['side']
+                pnl = f"${trade['pnl']:.2f}"
+                label = f"{timestamp} / {direction} / {pnl}"
+                trade_options.append((idx, label))
+            
+            # Dropdown for selecting trade
+            selected_trade = st.selectbox("Select Trade", 
+                                          options=trade_options,
+                                          format_func=lambda x: x[1],
+                                          key=f"trade_select_{symbol}")
+            
+            # Timeframe selection
+            timeframe_options = ['1min', '5min', '15min', '1H']
+            selected_timeframe = st.selectbox("Select Chart Timeframe", 
+                                              timeframe_options, 
+                                              index=0, 
+                                              key=f"timeframe_{symbol}")
+            
+            if selected_trade:
+                trade_idx = selected_trade[0]
+                trade = symbol_trades.loc[trade_idx]
+                
+                # Notes section
+                st.subheader("Notes")
+                current_notes = trade.get('notes', '')
+                new_notes = st.text_area("Edit Notes", value=current_notes, height=200, 
+                                         key=f"notes_text_{symbol}_{trade_idx}")
+                
+                if st.button("Update Trade", key=f"update_trade_{symbol}_{trade_idx}"):
+                    # Update notes in enhanced_trades
+                    st.session_state.enhanced_trades.loc[trade_idx, 'notes'] = new_notes
+                    
+                    # Update database
+                    conn = sqlite3.connect('trading_journal_analyzer.db')
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE enhanced_trades SET notes = ? WHERE id = ?', 
+                                  (new_notes, trade_idx + 1))  # id is 1-based in SQLite
+                    conn.commit()
+                    conn.close()
+                    
+                    st.success("Trade notes updated successfully!")
+    
+    with right:
+        # Resample market data based on selected timeframe
+        if has_market_data:
+            symbol_market_data = resample_ohlc(symbol_market_data, selected_timeframe)
+        
+        # Create the chart
+        fig = go.Figure()
+        
+        # Add candlestick chart if market data is available
+        if has_market_data:
+            fig.add_trace(go.Candlestick(
+                x=symbol_market_data['time'],
+                open=symbol_market_data['open'],
+                high=symbol_market_data['high'],
+                low=symbol_market_data['low'],
+                close=symbol_market_data['close'],
+                name=f'{symbol} Price',
+                increasing_line_color=st.session_state.chart_colors['up_candle_color'],
+                decreasing_line_color=st.session_state.chart_colors['down_candle_color'],
+                showlegend=False
+            ))
+        
+        # Add trade buy/sell points and connections if trade data is available
+        if has_trade_data:
+            # Define flooring rule based on selected timeframe
+            floor_rule = {
+                '1min': '1T',
+                '5min': '5T',
+                '15min': '15T',
+                '1H': '60T'
+            }[selected_timeframe]
+            
+            # Determine which trades to plot based on checkbox
+            if show_only_selected and selected_trade:
+                trades_to_plot = [(selected_trade[0], symbol_trades.loc[selected_trade[0]])]
+            else:
+                trades_to_plot = list(symbol_trades.iterrows())
+            
+            for idx, trade in trades_to_plot:
+                # Use trade_line_color for winning trades, trade_line_loss_color for losing trades
+                pnl_color = st.session_state.chart_colors['trade_line_color'] if trade['pnl'] > 0 else st.session_state.chart_colors['trade_line_loss_color']
+                
+                # Floor timestamps to the selected timeframe
+                buy_time_plot = pd.Timestamp(trade['boughtTimestamp']).floor(floor_rule)
+                sell_time_plot = pd.Timestamp(trade['soldTimestamp']).floor(floor_rule)
+                
+                # Buy point (triangle-up)
+                fig.add_trace(go.Scatter(
+                    x=[buy_time_plot],
+                    y=[trade['buyPrice']],
+                    mode='markers',
+                    marker=dict(
+                        symbol='triangle-up',
+                        size=12,
+                        color=st.session_state.chart_colors['buy_triangle_color'],
+                        line=dict(color='black', width=1)
+                    ),
+                    name="Buy Action",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"Buy Action<br>"
+                        f"Price: ${trade['buyPrice']:.2f}<br>"
+                        f"Original Time: {trade['boughtTimestamp']}<br>"
+                        f"Plotted Time: {buy_time_plot}<br>"
+                        f"Side: {trade['side']}<br>"
+                        f"P&L: ${trade['pnl']:.2f}<br>"
+                        f"Notes: {trade.get('notes', '')}<extra></extra>"
+                    )
+                ))
+                
+                # Sell point (triangle-down)
+                fig.add_trace(go.Scatter(
+                    x=[sell_time_plot],
+                    y=[trade['sellPrice']],
+                    mode='markers',
+                    marker=dict(
+                        symbol='triangle-down',
+                        size=12,
+                        color=st.session_state.chart_colors['sell_triangle_color'],
+                        line=dict(color='black', width=1)
+                    ),
+                    name="Sell Action",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"Sell Action<br>"
+                        f"Price: ${trade['sellPrice']:.2f}<br>"
+                        f"Original Time: {trade['soldTimestamp']}<br>"
+                        f"Plotted Time: {sell_time_plot}<br>"
+                        f"Side: {trade['side']}<br>"
+                        f"P&L: ${trade['pnl']:.2f}<br>"
+                        f"Notes: {trade.get('notes', '')}<extra></extra>"
+                    )
+                ))
+                
+                # Connect buy and sell with line colored by P&L
+                fig.add_trace(go.Scatter(
+                    x=[buy_time_plot, sell_time_plot],
+                    y=[trade['buyPrice'], trade['sellPrice']],
+                    mode='lines',
+                    line=dict(color=pnl_color, width=2, dash='dot'),
+                    name="Trade Line" if trade['pnl'] > 0 else "Loss Line",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"Trade Line<br>"
+                        f"Symbol: {trade['symbol']}<br>"
+                        f"P&L: ${trade['pnl']:.2f}<br>"
+                        f"Notes: {trade.get('notes', '')}<extra></extra>"
+                    )
+                ))
+        
+        # Set chart title and layout
+        chart_title = f"{symbol} - "
+        if has_market_data and has_trade_data:
+            chart_title += f"Market Data with Trade Buy/Sell Points ({selected_timeframe})"
+        elif has_market_data:
+            chart_title += f"Market Data Only ({selected_timeframe})"
+        else:
+            chart_title += "Trade Buy/Sell Points Only"
+        
+        fig.update_layout(
+            title=chart_title,
+            xaxis_title="Time",
+            yaxis_title="Price",
+            height=1000,
+            xaxis_rangeslider_visible=False,
+            yaxis=dict(
+                side='right',
+                gridcolor=st.session_state.chart_colors['text_grid_color']
+            ),
+            plot_bgcolor=st.session_state.chart_colors['plot_bgcolor'],
+            paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper background
+            font=dict(color=st.session_state.chart_colors['text_grid_color']),
+            xaxis=dict(
+                gridcolor=st.session_state.chart_colors['text_grid_color']
+            ),
+            showlegend=False
+        )
+        
+        # If a trade is selected, adjust x and y axes
+        if selected_trade:
+            trade = symbol_trades.loc[selected_trade[0]]
+            entry_time = pd.to_datetime(trade['entry_time'])
+            exit_time = pd.to_datetime(trade['exit_time'])
+            timeframe_minutes = {
+                '1min': 1,
+                '5min': 5,
+                '15min': 15,
+                '1H': 60
+            }[selected_timeframe]
+            candle_count = 30
+            padding_minutes = candle_count * timeframe_minutes
+            x_min = entry_time - timedelta(minutes=padding_minutes)
+            x_max = exit_time + timedelta(minutes=padding_minutes)
+            fig.update_xaxes(range=[x_min, x_max])
+            
+            # Scale Y-axis to data in range
+            if has_market_data:
+                mask = (symbol_market_data['time'] >= x_min) & (symbol_market_data['time'] <= x_max)
+                filtered_data = symbol_market_data[mask]
+                
+                if not filtered_data.empty:
+                    y_min = filtered_data['low'].min()
+                    y_max = filtered_data['high'].max()
+                    y_min = min(y_min, trade['entry_price'], trade['exit_price'])
+                    y_max = max(y_max, trade['entry_price'], trade['exit_price'])
+                    margin = (y_max - y_min) * 0.05
+                    fig.update_yaxes(range=[y_min - margin, y_max + margin])
+        
+        # Render chart with toolbar always visible
+        st.plotly_chart(fig, use_container_width=True, 
+                        config={'displayModeBar': True})
+    
+    # Color controls below the chart
+    st.subheader("Chart Color Settings")
+    color_settings = [
+        ('Plot Background', 'plot_bgcolor'),
+        ('Text & Grid Lines', 'text_grid_color'),
+        ('Up Candles', 'up_candle_color'),
+        ('Down Candles', 'down_candle_color'),
+        ('Buy Triangles', 'buy_triangle_color'),
+        ('Sell Triangles', 'sell_triangle_color'),
+        ('Trade Lines (Win)', 'trade_line_color'),
+        ('Trade Lines (Loss)', 'trade_line_loss_color')
+    ]
+    
+    # Create two rows of 4 columns each
+    row1 = st.columns(4)
+    row2 = st.columns(4)
+    
+    for i, (label, key) in enumerate(color_settings):
+        with row1[i % 4] if i < 4 else row2[i % 4]:
+            new_color = st.color_picker(f"{label}", 
+                                        value=st.session_state.chart_colors[key],
+                                        key=f"color_{key}_{symbol}")
+            if new_color != st.session_state.chart_colors[key]:
+                st.session_state.chart_colors[key] = new_color
+                analyzer.save_chart_settings()
+    
+    # Display trade summary for this symbol
+    if has_trade_data:
+        st.subheader(f"Trade Summary for {symbol}")
+        
+        total_pnl = symbol_trades['pnl'].sum()
+        total_trades = len(symbol_trades)
+        win_rate = (symbol_trades['pnl'] > 0).sum() / total_trades * 100 if total_trades > 0 else 0
+        avg_pnl = symbol_trades['pnl'].mean() if total_trades > 0 else 0
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Trades", total_trades)
+        with col2:
+            st.metric("Total P&L", f"${total_pnl:.2f}")
+        with col3:
+            st.metric("Win Rate", f"{win_rate:.1f}%")
+        with col4:
+            st.metric("Avg P&L/Trade", f"${avg_pnl:.2f}")
+    
+    # Show data range information
+    if has_market_data or has_trade_data:
+        st.subheader(f"Data Range for {symbol}")
+        
+        if has_market_data:
+            market_start = symbol_market_data['time'].min()
+            market_end = symbol_market_data['time'].max()
+            st.write(f"**Market Data:** {market_start} to {market_end}")
+        
+        if has_trade_data:
+            buy_start = pd.to_datetime(symbol_trades['boughtTimestamp']).min()
+            buy_end = pd.to_datetime(symbol_trades['boughtTimestamp']).max()
+            sell_start = pd.to_datetime(symbol_trades['soldTimestamp']).min()
+            sell_end = pd.to_datetime(symbol_trades['soldTimestamp']).max()
+            overall_start = min(buy_start, sell_start)
+            overall_end = max(buy_end, sell_end)
+            st.write(f"**Trade Data (Buy/Sell):** {overall_start} to {overall_end}")
+            
+        if has_market_data and has_trade_data:
+            trades_outside_market = 0
+            for _, trade in symbol_trades.iterrows():
+                buy_time = pd.to_datetime(trade['boughtTimestamp'])
+                sell_time = pd.to_datetime(trade['soldTimestamp'])
+                if buy_time < market_start or buy_time > market_end or sell_time < market_start or sell_time > market_end:
+                    trades_outside_market += 1
+            
+            if trades_outside_market > 0:
+                st.warning(f"⚠️ {trades_outside_market} trades fall outside the market data time range")
+            else:
+                st.success("✅ All trades fall within market data time range")
+
+
+def show_side_analysis():
+    """Display per side metrics"""
+    st.header("📊 Side Analysis")
+
+    if st.session_state.enhanced_trades.empty:
+        st.warning("No enhanced trades available. Please run analysis first.")
+        return
+
+    df = st.session_state.enhanced_trades.copy()
+
+    # Calculate metrics per side
+    side_metrics = df.groupby('side').agg(
+        total_pnl=('pnl', 'sum'),
+        num_trades=('pnl', 'count'),
+        win_rate=('pnl', lambda x: (x > 0).sum() / len(x) * 100 if len(x) > 0 else 0),
+        avg_win=('pnl', lambda x: x[x > 0].mean() if (x > 0).any() else 0),
+        avg_loss=('pnl', lambda x: x[x <= 0].mean() if (x <= 0).any() else 0),
+        largest_win=('pnl', lambda x: x[x > 0].max() if (x > 0).any() else 0),
+        largest_loss=('pnl', lambda x: x[x <= 0].min() if (x <= 0).any() else 0),
+        avg_duration=('duration_minutes', 'mean'),
+        gross_profit=('pnl', lambda x: x[x > 0].sum() if (x > 0).any() else 0),
+        gross_loss=('pnl', lambda x: abs(x[x <= 0].sum()) if (x <= 0).any() else 0),
+        avg_mae=('mae', lambda x: x.mean() if not x.isna().all() else 0),
+        avg_mfe=('mfe', lambda x: x.mean() if not x.isna().all() else 0)
+    ).reset_index()
+
+    # Calculate profit factor
+    side_metrics['profit_factor'] = side_metrics.apply(
+        lambda row: row['gross_profit'] / row['gross_loss'] if row['gross_loss'] > 0 else float('inf'),
+        axis=1
+    )
+
+    # Display metrics table
+    st.subheader("Side Metrics Table")
+    st.dataframe(side_metrics.style.format({
+        'total_pnl': '${:,.2f}',
+        'num_trades': '{:,.0f}',
+        'win_rate': '{:.1f}%',
+        'avg_win': '${:,.2f}',
+        'avg_loss': '${:,.2f}',
+        'largest_win': '${:,.2f}',
+        'largest_loss': '${:,.2f}',
+        'avg_duration': '{:.1f} min',
+        'gross_profit': '${:,.2f}',
+        'gross_loss': '${:,.2f}',
+        'profit_factor': lambda x: "∞" if x == float('inf') else f"{x:.2f}",
+        'avg_mae': '${:,.2f}',
+        'avg_mfe': '${:,.2f}'
+    }), use_container_width=True)
+
+    # P&L by Side chart
+    st.subheader("P&L by Side")
+    fig = px.bar(side_metrics, x='side', y='total_pnl', 
+                 color='total_pnl', color_continuous_scale='RdYlGn',
+                 title="Total P&L by Trade Side")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Win Rate by Side
+    st.subheader("Win Rate by Side")
+    fig = px.bar(side_metrics, x='side', y='win_rate', 
+                 color='win_rate', color_continuous_scale='RdYlGn',
+                 title="Win Rate by Trade Side")
+    fig.update_yaxes(title="Win Rate (%)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Average Win and Loss by Side
+    st.subheader("Average Win/Loss by Side")
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Average Win", "Average Loss"))
+    fig.add_trace(go.Bar(x=side_metrics['side'], y=side_metrics['avg_win'], name="Avg Win", marker_color='green'), row=1, col=1)
+    fig.add_trace(go.Bar(x=side_metrics['side'], y=side_metrics['avg_loss'], name="Avg Loss", marker_color='red'), row=1, col=2)
+    fig.update_yaxes(title_text="Amount ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Amount ($)", row=1, col=2)
+    fig.update_layout(showlegend=True, height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+def show_market_conditions():
+    """Display market conditions and volatility metrics"""
+    st.header("📊 Market Conditions")
+
+    if st.session_state.market_data.empty or st.session_state.enhanced_trades.empty:
+        st.warning("No market or trade data available. Please import and analyze data.")
+        return
+
+    market_data = st.session_state.market_data.copy()
+    trades = st.session_state.enhanced_trades.copy()
+
+    # Calculate ATR for each symbol
+    market_data = market_data.groupby('symbol').apply(calculate_atr).reset_index(drop=True)
+
+    # Floor trade entry times to nearest minute for matching
+    trades['entry_time_floor'] = pd.to_datetime(trades['entry_time']).dt.floor('min')
+
+    # Merge trades with market data to get ATR at entry time
+    trades = trades.merge(
+        market_data[['symbol', 'time', 'atr']],
+        left_on=['symbol_letters', 'entry_time_floor'],
+        right_on=['symbol', 'time'],
+        how='left'
+    )
+
+    # Define volatility conditions using ATR quantiles
+    atr_quantiles = market_data['atr'].quantile([0.33, 0.67])
+    trades['vol_condition'] = pd.cut(
+        trades['atr'],
+        bins=[0, atr_quantiles.iloc[0], atr_quantiles.iloc[1], np.inf],
+        labels=['Low', 'Medium', 'High'],
+        include_lowest=True
+    )
+
+    # Handle cases where ATR is missing
+    trades['vol_condition'] = trades['vol_condition'].cat.add_categories(['Unknown']).fillna('Unknown')
+
+    # Display volatility distribution
+    st.subheader("ATR Distribution")
+    fig = px.histogram(
+        market_data,
+        x='atr',
+        title="Distribution of ATR Across All Symbols",
+        nbins=30
+    )
+    fig.add_vline(x=atr_quantiles.iloc[0], line_dash="dash", line_color="blue", annotation_text="Low-Med", annotation_position="top left")
+    fig.add_vline(x=atr_quantiles.iloc[1], line_dash="dash", line_color="red", annotation_text="Med-High", annotation_position="top right")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Trade metrics by volatility condition
+    st.subheader("Trade Metrics by Volatility Condition")
+    vol_metrics = trades.groupby('vol_condition').agg(
+        total_pnl=('pnl', 'sum'),
+        num_trades=('pnl', 'count'),
+        win_rate=('pnl', lambda x: (x > 0).sum() / len(x) * 100 if len(x) > 0 else 0),
+        avg_win=('pnl', lambda x: x[x > 0].mean() if (x > 0).any() else 0),
+        avg_loss=('pnl', lambda x: x[x <= 0].mean() if (x <= 0).any() else 0),
+        avg_duration=('duration_minutes', 'mean'),
+        avg_mae=('mae', lambda x: x.mean() if not x.isna().all() else 0),
+        avg_mfe=('mfe', lambda x: x.mean() if not x.isna().all() else 0)
+    ).reset_index()
+
+    # Calculate profit factor
+    vol_metrics['profit_factor'] = vol_metrics.apply(
+        lambda row: row['total_pnl'] / abs(row['avg_loss'] * (row['num_trades'] - (row['win_rate'] / 100) * row['num_trades']))
+        if (row['avg_loss'] != 0 and row['num_trades'] > 0) else float('inf'),
+        axis=1
+    )
+
+    st.dataframe(vol_metrics.style.format({
+        'total_pnl': '${:,.2f}',
+        'num_trades': '{:,.0f}',
+        'win_rate': '{:.1f}%',
+        'avg_win': '${:,.2f}',
+        'avg_loss': '${:,.2f}',
+        'avg_duration': '{:.1f} min',
+        'avg_mae': '${:,.2f}',
+        'avg_mfe': '${:,.2f}',
+        'profit_factor': lambda x: "∞" if x == float('inf') else f"{x:.2f}"
+    }), use_container_width=True)
+
+    # P&L by Volatility
+    st.subheader("P&L by Volatility Condition")
+    fig = px.bar(
+        vol_metrics,
+        x='vol_condition',
+        y='total_pnl',
+        color='total_pnl',
+        color_continuous_scale='RdYlGn',
+        title="Total P&L by Volatility Condition"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Win Rate by Volatility
+    st.subheader("Win Rate by Volatility Condition")
+    fig = px.bar(
+        vol_metrics,
+        x='vol_condition',
+        y='win_rate',
+        color='win_rate',
+        color_continuous_scale='RdYlGn',
+        title="Win Rate by Volatility Condition"
+    )
+    fig.update_yaxes(title="Win Rate (%)")
+    st.plotly_chart(fig, use_container_width=True)
+
+def show_performance_analytics():
+    """Display performance analytics charts"""
+    st.header("📉 Performance Analytics")
+    
+    if st.session_state.enhanced_trades.empty:
+        st.warning("No enhanced trades available. Please run analysis first.")
+        return
+    
+    df = st.session_state.enhanced_trades.copy()
+    
+    # P&L Distribution
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("P&L Distribution")
+        fig = px.histogram(df, x='pnl', nbins=30, title="P&L Distribution")
+        fig.add_vline(x=0, line_dash="dash", line_color="red")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("Duration vs P&L")
+        fig = px.scatter(df, x='duration_minutes', y='pnl',
+                        color='pnl', color_continuous_scale='RdYlGn',
+                        title="Trade Duration vs P&L")
+        fig.add_hline(y=0, line_dash="dash", line_color="black")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # P&L by Hour
+    st.subheader("P&L by Hour")
+    df['hour'] = pd.to_datetime(df['entry_time']).dt.hour
+    hourly_pnl = df.groupby('hour')['pnl'].sum().reset_index()
+    fig = px.bar(hourly_pnl, x='hour', y='pnl',
+                color='pnl', color_continuous_scale='RdYlGn',
+                title="P&L by Hour of Day")
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Heatmaps
+    if len(df) > 0:
+        st.subheader("📊 Performance Heatmaps")
+        
+        # Create pivot table for heatmap with ordered days
+        df['day_of_week'] = pd.to_datetime(df['entry_time']).dt.day_name()
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        pivot_data = df.pivot_table(
+            index='day_of_week', 
+            columns='hour', 
+            values='pnl', 
+            aggfunc='sum',
+            fill_value=0
+        )
+        
+        # Reindex to enforce day order (Monday to Sunday, top to bottom)
+        pivot_data = pivot_data.reindex(day_order)
+        
+        if not pivot_data.empty:
+            fig = px.imshow(
+                pivot_data.values,
+                x=pivot_data.columns,
+                y=pivot_data.index,
+                color_continuous_scale='RdYlGn',
+                title="P&L Heatmap by Day and Hour"
+            )
+            fig.update_layout(
+                xaxis_title="Hour of Day",
+                yaxis_title="Day of Week",
+                yaxis=dict(autorange="reversed")  # Ensure Monday is at the top
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def show_risk_analysis():
+    """Display risk analysis charts with win/loss streak bar chart"""
+    st.header("⚠️ Risk Analysis")
+    
+    if st.session_state.enhanced_trades.empty:
+        st.warning("No enhanced trades available. Please run analysis first.")
+        return
+    
+    df = st.session_state.enhanced_trades.sort_values('exit_time').copy()
+    
+    # Drawdown Analysis
+    df['cumulative_pnl'] = df['pnl'].cumsum()
+    df['running_max'] = df['cumulative_pnl'].expanding().max()
+    df['drawdown'] = df['cumulative_pnl'] - df['running_max']
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Equity Curve with Drawdowns")
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=df['exit_time'],
+            y=df['cumulative_pnl'],
+            mode='lines',
+            name='Equity Curve',
+            line=dict(color='blue')
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=df['exit_time'],
+            y=df['running_max'],
+            mode='lines',
+            name='High Water Mark',
+            line=dict(color='green', dash='dash')
+        ))
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("Drawdown")
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=df['exit_time'],
+            y=df['drawdown'],
+            fill='tonexty',
+            fillcolor='rgba(255,0,0,0.3)',
+            line=dict(color='red'),
+            name='Drawdown'
+        ))
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Win/Loss Streaks
+    st.subheader("📈 Win/Loss Streak Analysis")
+    
+    # Sort by entry_time for streak calculation
+    df = df.sort_values('entry_time')
+    df['win'] = df['pnl'] > 0
+    
+    # Calculate complete streaks
+    streaks = []
+    streak_start_times = []
+    current_streak = 0
+    current_type = None
+    
+    for idx, row in df.iterrows():
+        is_win = row['win']
+        
+        if current_type is None:
+            # Start a new streak
+            current_type = 'win' if is_win else 'loss'
+            current_streak = 1 if is_win else -1
+            streak_start_times.append(row['entry_time'])
+        elif is_win == (current_type == 'win'):
+            # Continue the streak
+            current_streak += 1 if is_win else -1
+        else:
+            # End current streak and start a new one
+            streaks.append(current_streak)
+            current_type = 'win' if is_win else 'loss'
+            current_streak = 1 if is_win else -1
+            streak_start_times.append(row['entry_time'])
+    
+    # Append the last streak
+    if current_streak != 0:
+        streaks.append(current_streak)
+    
+    # Create bar chart
+    fig = go.Figure()
+    
+    # Colors for win/loss streaks
+    colors = ['green' if streak > 0 else 'red' for streak in streaks]
+    
+    fig.add_trace(go.Bar(
+        x=streak_start_times,
+        y=streaks,
+        marker_color=colors,
+        text=[f"{s:+d}" for s in streaks],  # Show +3 or -7
+        textposition='auto',
+        hovertemplate=(
+            "Streak: %{y:+d}<br>" +
+            "Start Time: %{x}<br>" +
+            "<extra></extra>"
+        )
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="black")
+    fig.update_layout(
+        title="Win/Loss Streak Progression",
+        xaxis_title="Streak Start Time",
+        yaxis_title="Streak Length (Positive = Wins, Negative = Losses)",
+        height=600,
+        showlegend=False
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def show_calendar_view():
+    """Display a calendar-style heatmap of trading performance"""
+    st.header("📅 Calendar View")
+
+    if st.session_state.enhanced_trades.empty:
+        st.warning("No enhanced trades available. Please run analysis first.")
+        return
+
+    df = st.session_state.enhanced_trades.copy()
+    df['date'] = pd.to_datetime(df['entry_time']).dt.date
+
+    # Month and year selection
+    available_dates = sorted(df['date'].unique())
+    if not available_dates:
+        st.warning("No trade dates available.")
+        return
+
+    min_date = min(available_dates)
+    max_date = max(available_dates)
+
+    # Initialize session state for month/year navigation
+    if 'calendar_year' not in st.session_state:
+        st.session_state.calendar_year = datetime.now().year
+    if 'calendar_month' not in st.session_state:
+        st.session_state.calendar_month = datetime.now().month
+
+    # Navigation controls
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("← Previous Month"):
+            current_date = datetime(st.session_state.calendar_year, st.session_state.calendar_month, 1)
+            prev_month = current_date - timedelta(days=1)
+            st.session_state.calendar_year = prev_month.year
+            st.session_state.calendar_month = prev_month.month
+            st.rerun()
+
+    with col2:
+        selected_year = st.selectbox(
+            "Select Year",
+            options=range(min_date.year, max_date.year + 1),
+            index=st.session_state.calendar_year - min_date.year,
+            key="calendar_year_select"
+        )
+        selected_month = st.selectbox(
+            "Select Month",
+            options=list(range(1, 13)),
+            format_func=lambda x: calendar.month_name[x],
+            index=st.session_state.calendar_month - 1,
+            key="calendar_month_select"
+        )
+        if selected_year != st.session_state.calendar_year or selected_month != st.session_state.calendar_month:
+            st.session_state.calendar_year = selected_year
+            st.session_state.calendar_month = selected_month
+            st.rerun()
+
+    with col3:
+        if st.button("Next Month →"):
+            current_date = datetime(st.session_state.calendar_year, st.session_state.calendar_month, 1)
+            next_month = (current_date + timedelta(days=32)).replace(day=1)
+            st.session_state.calendar_year = next_month.year
+            st.session_state.calendar_month = next_month.month
+            st.rerun()
+
+    # Filter data for selected month
+    start_date = datetime(st.session_state.calendar_year, st.session_state.calendar_month, 1).date()
+    next_month = (datetime(st.session_state.calendar_year, st.session_state.calendar_month, 1) + timedelta(days=32)).replace(day=1)
+    end_date = (next_month - timedelta(days=1)).date()
+    mask = (df['date'] >= start_date) & (df['date'] <= end_date)
+    filtered_df = df[mask]
+
+    if filtered_df.empty:
+        st.warning(f"No trades found for {calendar.month_name[st.session_state.calendar_month]} {st.session_state.calendar_year}.")
+        return
+
+    # Daily summary
+    daily_summary = filtered_df.groupby('date').agg({
+        'pnl': ['sum', 'count'],
+        'duration_minutes': 'mean'
+    }).round(2)
+    daily_summary.columns = ['Total P&L', 'Trade Count', 'Avg Duration']
+    daily_summary = daily_summary.reset_index()
+
+    # Create calendar heatmap
+    year = st.session_state.calendar_year
+    month = st.session_state.calendar_month
+    cal = calendar.monthcalendar(year, month)
+    num_weeks = len(cal)
+
+    # Prepare heatmap data
+    z = []
+    text = []
+    hover_text = []
+    for week in cal:
+        week_data = [0] * 7
+        week_text = [''] * 7
+        week_hover = [''] * 7
+        for i, day in enumerate(week):
+            if day != 0:
+                date = datetime(year, month, day).date()
+                day_data = daily_summary[daily_summary['date'] == date]
+                if not day_data.empty:
+                    week_data[i] = day_data['Total P&L'].iloc[0]
+                    week_text[i] = f"{day}<br>${day_data['Total P&L'].iloc[0]:.2f}"
+                    week_hover[i] = (
+                        f"Date: {date}<br>"
+                        f"Total P&L: ${day_data['Total P&L'].iloc[0]:.2f}<br>"
+                        f"Trade Count: {day_data['Trade Count'].iloc[0]}<br>"
+                        f"Avg Duration: {day_data['Avg Duration'].iloc[0]:.0f} min"
+                    )
+                else:
+                    week_text[i] = str(day)
+                    week_hover[i] = f"Date: {date}<br>No trades"
+            else:
+                week_text[i] = ''
+                week_hover[i] = ''
+        z.append(week_data)
+        text.append(week_text)
+        hover_text.append(week_hover)
+
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+        y=[f"Week {i+1}" for i in range(num_weeks)],
+        text=text,
+        texttemplate="%{text}",
+        textfont=dict(size=14, color='black'),
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=hover_text,
+        colorscale='RdYlGn',
+        showscale=True,
+        colorbar=dict(title="P&L ($)"),
+        zmid=0  # Center the colorscale at zero
+    ))
+
+    fig.update_layout(
+        title=f"Trading Performance - {calendar.month_name[month]} {year}",
+        xaxis_title="Day of Week",
+        yaxis_title="Week",
+        height=400 + num_weeks * 50,
+        xaxis=dict(
+            tickmode='array',
+            tickvals=[0, 1, 2, 3, 4, 5, 6],
+            ticktext=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        ),
+        yaxis=dict(autorange="reversed"),  # Weeks go top to bottom
+        margin=dict(l=100, r=50, t=100, b=50)
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Daily summary table
+    st.subheader("📋 Daily Summary")
+    display_summary = daily_summary.copy()
+    display_summary['Total P&L'] = display_summary['Total P&L'].apply(lambda x: f"${x:.2f}")
+    display_summary['Avg Duration'] = display_summary['Avg Duration'].apply(lambda x: f"{x:.0f} min")
+    st.dataframe(display_summary, use_container_width=True)
+
+    # Trade details for selected date
+    st.subheader("📝 Trade Details")
+    default_date = max(min_date, start_date)
+    default_date = min(default_date, max_date)  # Ensure it's not beyond max_date
+    selected_date = st.date_input(
+        "Select Date for Trade Details",
+        value=default_date,
+        min_value=min_date,
+        max_value=max_date,
+        key="calendar_date_select"
+    )
+
+    date_trades = filtered_df[filtered_df['date'] == selected_date]
+    if date_trades.empty:
+        st.info(f"No trades on {selected_date}.")
+    else:
+        display_df = date_trades.copy()
+        display_df['Entry Time'] = pd.to_datetime(display_df['entry_time']).dt.strftime('%H:%M:%S')
+        display_df['Exit Time'] = pd.to_datetime(display_df['exit_time']).dt.strftime('%H:%M:%S')
+        display_df['P&L'] = display_df['pnl'].apply(lambda x: f"${x:.2f}")
+        display_df['P&L %'] = display_df['pnl_pct'].apply(lambda x: f"{x:.2f}%")
+        display_df['Entry Price'] = display_df['entry_price'].apply(lambda x: f"${x:.2f}")
+        display_df['Exit Price'] = display_df['exit_price'].apply(lambda x: f"${x:.2f}")
+        display_df['Duration'] = display_df['duration_minutes'].apply(lambda x: f"{x:.0f}m")
+        display_df['Notes'] = display_df['notes'].fillna('')
+
+        columns_to_show = ['symbol', 'Entry Time', 'Exit Time', 'side', 'qty', 'Entry Price', 
+                          'Exit Price', 'P&L', 'P&L %', 'Duration', 'notes']
+
+        st.dataframe(
+            display_df[columns_to_show].rename(columns={
+                'symbol': 'Symbol',
+                'side': 'Side',
+                'qty': 'Qty',
+                'notes': 'Notes'
+            }),
+            use_container_width=True
+        )
+
+if __name__ == "__main__":
+    main()
